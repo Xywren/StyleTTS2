@@ -17,7 +17,7 @@ repo_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, repo_root)
 os.chdir(repo_root)
 
-# Exit when the parent process (ARI) dies, even on SIGKILL.
+# Exit when the parent process dies, even on SIGKILL.
 import threading, time as _time
 def _watch_parent(ppid=os.getppid()):
     while True:
@@ -146,42 +146,24 @@ def compute_style(path):
 ref_s = compute_style(args.ref_audio)
 
 from text_utils import TextCleaner
-import gruut
+# Shared text->IPA phonemizer — the SAME module the training-list builder uses, so
+# training and inference feed the model an identical token alphabet.
+from ari_phonemize import preprocess, phonemize
 
 textcleaner = TextCleaner()
 
-import re as _re
-
-# Word substitutions applied before phonemization.
-# Keys are regex patterns (case-insensitive), values are replacement spellings
-# that gruut will phonemize correctly.
-_WORD_SUBS = [
-    (r'\bA\.R\.I\.?\b', 'are-ree'),  # A.R.I. → /ɑɹ ɹi/
-    (r'\bARI\b',        'are-ree'),  # ARI → /ɑɹ ɹi/
-]
-
-def preprocess(text):
-    for pattern, replacement in _WORD_SUBS:
-        text = _re.sub(pattern, replacement, text, flags=_re.IGNORECASE)
-    # Ensure trailing punctuation so the duration predictor doesn't clip the last word
-    text = text.strip()
-    if text and text[-1] not in '.!?,;:':
-        text += '.'
-    return text
-
-def phonemize(text):
-    words = []
-    for sentence in gruut.sentences(text, lang='en-us'):
-        for word in sentence:
-            if hasattr(word, 'phonemes') and word.phonemes:
-                words.append(''.join(word.phonemes))
-    return ' '.join(words)
+# Token ids that represent a pause (space + sentence punctuation). Used to lengthen
+# pauses independently of overall speed. Built from the symbol table so it stays in sync.
+_PAUSE_CHARS = ' ,.;:!?…—'
+_PAUSE_IDS = {textcleaner.word_index_dictionary[c]
+              for c in _PAUSE_CHARS if c in textcleaner.word_index_dictionary}
 
 def length_to_mask(lengths):
     mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
     return torch.gt(mask + 1, lengths.unsqueeze(1))
 
-def synthesise_text(text, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1.0):
+def synthesise_text(text, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1.0,
+                    speed=1.0, pause_scale=1.0):
     text = preprocess(text.replace('"', ''))
     tokens = textcleaner(phonemize(text))
     tokens.insert(0, 0)
@@ -210,7 +192,17 @@ def synthesise_text(text, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scal
         d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
         x, _ = model.predictor.lstm(d)
         duration = torch.sigmoid(model.predictor.duration_proj(x)).sum(axis=-1)
-        pred_dur = torch.nan_to_num(torch.round(duration.squeeze()), nan=1.0).clamp(min=1, max=10)
+        # speed scales all durations (time-stretch, not pitch); pause_scale lengthens only
+        # pause tokens. Applied on the float durations before rounding.
+        dur = duration.squeeze() / speed
+        if pause_scale != 1.0:
+            tok_ids = tokens.squeeze(0)
+            mult = torch.ones_like(dur)
+            for i in range(dur.shape[0]):
+                if int(tok_ids[i]) in _PAUSE_IDS:
+                    mult[i] = pause_scale
+            dur = dur * mult
+        pred_dur = torch.nan_to_num(torch.round(dur), nan=1.0).clamp(min=1, max=50)
 
         pred_aln = torch.zeros(input_lengths, int(pred_dur.sum().data))
         c = 0
@@ -269,10 +261,13 @@ def synthesise():
     alpha            = float(data.get('alpha', 0.3))
     beta             = float(data.get('beta', 0.7))
     embedding_scale  = float(data.get('embedding_scale', 1.0))
+    speed            = float(data.get('speed', 1.0))
+    pause_scale      = float(data.get('pause_scale', 1.0))
     import sys as _sys
-    _sys.stderr.write(f'[synthesise] text={repr(text)} steps={diffusion_steps} alpha={alpha} beta={beta} scale={embedding_scale}\n'); _sys.stderr.flush()
+    _sys.stderr.write(f'[synthesise] text={repr(text)} steps={diffusion_steps} alpha={alpha} beta={beta} scale={embedding_scale} speed={speed} pause={pause_scale}\n'); _sys.stderr.flush()
     with _model_lock:
-        wav = synthesise_text(text, alpha=alpha, beta=beta, diffusion_steps=diffusion_steps, embedding_scale=embedding_scale)
+        wav = synthesise_text(text, alpha=alpha, beta=beta, diffusion_steps=diffusion_steps,
+                              embedding_scale=embedding_scale, speed=speed, pause_scale=pause_scale)
     _raw_peak = np.abs(wav).max()
     _raw_nans = int(np.isnan(wav).sum())
     _sys.stderr.write(f'[synthesise] raw shape={wav.shape} peak={_raw_peak:.4f} nans={_raw_nans}\n'); _sys.stderr.flush()
