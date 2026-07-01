@@ -1,3 +1,22 @@
+> # ⚠️ This is a fork
+>
+> This repository is a fork of **[yl4579/StyleTTS2](https://github.com/yl4579/StyleTTS2)** — all credit for StyleTTS 2 belongs to the original authors (see below). The original project's documentation lives in the upstream README: **[github.com/yl4579/StyleTTS2#readme](https://github.com/yl4579/StyleTTS2#readme)**.
+>
+> ### Why this fork exists
+>
+> I use StyleTTS 2 as the voice-synthesis engine in a personal assistant project. Running it on Apple Silicon (CPU/MPS) rather than CUDA required source-level changes that can't be layered on top of the upstream repo without editing its files, so I maintain them here as a fork (consumed as a git submodule) instead of patching upstream at runtime.
+>
+> **What differs from upstream:**
+> - **Device portability** — replaced hardcoded `.to('cuda')` and `y.get_device()` calls with device-agnostic equivalents so the model runs on CPU/MPS, not just CUDA.
+> - **MPS-safe STFT/mel** — route `torch.stft`/`istft`/mel transforms through CPU where Apple's MPS backend produces NaNs, moving only the magnitudes back to the original device (autograd is preserved).
+> - **CPU/MPS fine-tuning** — single-device passthrough in place of `DataParallel`, `num_workers=0`, `weights_only=False` (PyTorch 2.6), configurable device, and numerical guards against MPS flush-to-zero NaNs.
+> - **Robustness** — guard empty reference batches and cast waves to `float32` in the SLM adversarial loss.
+> - **`serve.py` / `dataset_process.py`** — small helper scripts specific to my use of the model.
+>
+> These changes are intended to be upstream-friendly; the portability fixes in particular may be useful to anyone running StyleTTS 2 off CUDA.
+>
+> ---
+
 # StyleTTS 2: Towards Human-Level Text-to-Speech through Style Diffusion and Adversarial Training with Large Speech Language Models
 
 ### Yinghao Aaron Li, Cong Han, Vinay S. Raghavan, Gavin Mischler, Nima Mesgarani
