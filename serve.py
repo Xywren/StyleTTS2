@@ -148,7 +148,7 @@ ref_s = compute_style(args.ref_audio)
 from text_utils import TextCleaner
 # Shared text->IPA phonemizer — the SAME module the training-list builder uses, so
 # training and inference feed the model an identical token alphabet.
-from ari_phonemize import preprocess, phonemize
+from phonemize import preprocess, phonemize
 
 textcleaner = TextCleaner()
 
