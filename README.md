@@ -4,16 +4,18 @@
 >
 > ### Why this fork exists
 >
-> I use StyleTTS 2 as the voice-synthesis engine in a personal assistant project. Running it on Apple Silicon (CPU/MPS) rather than CUDA required source-level changes that can't be layered on top of the upstream repo without editing its files, so I maintain them here as a fork (consumed as a git submodule) instead of patching upstream at runtime.
+> I use StyleTTS 2 as the voice-synthesis engine in a personal assistant project. Running it on Apple Silicon rather than CUDA required source-level changes that can't be layered on top of the upstream repo without editing its files, so I maintain them here as a fork (consumed as a git submodule) instead of patching upstream at runtime. **Training runs on CPU** (Apple's MPS backend drove training to NaN), while **inference runs on MPS**.
 >
 > **What differs from upstream:**
 > - **Device portability** — replaced hardcoded `.to('cuda')` and `y.get_device()` calls with device-agnostic equivalents so the model runs on CPU/MPS, not just CUDA.
-> - **MPS-safe STFT/mel** — route `torch.stft`/`istft`/mel transforms through CPU where Apple's MPS backend produces NaNs, moving only the magnitudes back to the original device (autograd is preserved).
-> - **CPU/MPS fine-tuning** — single-device passthrough in place of `DataParallel`, `num_workers=0`, `weights_only=False` (PyTorch 2.6), configurable device, and numerical guards against MPS flush-to-zero NaNs.
+> - **CPU fine-tuning** — single-device passthrough in place of `DataParallel`, `num_workers=0`, `weights_only=False` (PyTorch 2.6), configurable `device`, CPU thread setup, and a friendly error when the dataset is too small to form a batch. Also a `.stop_training` pause/checkpoint mechanism.
+> - **MPS-safe inference STFT** — `Modules/istftnet.py` routes `torch.stft`/`istft` through CPU (Apple's MPS backend produces NaNs there), moving only magnitudes back to the device; autograd is preserved. This is the inference decoder path.
 > - **Robustness** — guard empty reference batches and cast waves to `float32` in the SLM adversarial loss.
-> - **`serve.py` / `dataset_process.py`** — small helper scripts specific to my use of the model.
+> - **`serve.py`** — a Flask inference server (model load + hot-swap, style-vector precompute, NaN-weight validation, `speed`/`pause_scale` synthesis controls).
+> - **`phonemize.py`** — shared text→IPA phonemizer used by both `serve.py` and any training-list builder so training and inference share one token alphabet. Optional per-deployment substitutions/IPA overrides load from `PhonemeSubstitutions.json` (see `PhonemeSubstitutions.example.json`); a path can also be passed via `serve.py --phoneme_subs` or `phonemize.configure()`.
+> - **`dataset_process.py`** — a small dataset-prep helper.
 >
-> These changes are intended to be upstream-friendly; the portability fixes in particular may be useful to anyone running StyleTTS 2 off CUDA.
+> These changes are intended to be upstream-friendly; the device-portability fixes in particular may be useful to anyone running StyleTTS 2 off CUDA.
 >
 > ---
 
