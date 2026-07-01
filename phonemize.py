@@ -33,6 +33,13 @@ def _load_overrides(path=_SUBS_FILE):
 _SUBS, _OVERRIDES = _load_overrides()
 
 
+def configure(path):
+    """Reload substitutions/overrides from an explicit path (e.g. one supplied by the caller
+    that lives outside this repo). Call before preprocess()/phonemize()."""
+    global _SUBS, _OVERRIDES
+    _SUBS, _OVERRIDES = _load_overrides(path)
+
+
 def preprocess(text):
     """Normalise text before phonemization (spelling substitutions + trailing punctuation)."""
     for pattern, replacement in _SUBS:

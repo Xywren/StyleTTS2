@@ -10,6 +10,8 @@ parser.add_argument('--model',     required=True)
 parser.add_argument('--config',    required=True)
 parser.add_argument('--ref_audio', required=True)
 parser.add_argument('--port',      type=int, default=8020)
+parser.add_argument('--phoneme_subs', default=None,
+                    help='Path to a PhonemeSubstitutions.json outside this repo (optional).')
 args = parser.parse_args()
 
 # Run from the StyleTTS2 repo root so local imports resolve
@@ -148,6 +150,9 @@ ref_s = compute_style(args.ref_audio)
 from text_utils import TextCleaner
 # Shared text->IPA phonemizer — the SAME module the training-list builder uses, so
 # training and inference feed the model an identical token alphabet.
+import phonemize as _phonemize
+if args.phoneme_subs:
+    _phonemize.configure(args.phoneme_subs)
 from phonemize import preprocess, phonemize
 
 textcleaner = TextCleaner()
