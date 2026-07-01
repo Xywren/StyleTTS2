@@ -18,6 +18,8 @@ class SLMAdversarialLoss(torch.nn.Module):
         self.skip_update = skip_update
         
     def forward(self, iters, y_rec_gt, y_rec_gt_pred, waves, mel_input_length, ref_text, ref_lengths, use_ind, s_trg, ref_s=None):
+        if ref_lengths.max() == 0:
+            return None
         text_mask = length_to_mask(ref_lengths).to(ref_text.device)
         bert_dur = self.model.bert(ref_text, attention_mask=(~text_mask).int())
         d_en = self.model.bert_encoder(bert_dur).transpose(-1, -2) 
@@ -121,7 +123,7 @@ class SLMAdversarialLoss(torch.nn.Module):
             # get ground truth clips
             random_start = np.random.randint(0, mel_length_gt - mel_len)
             y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-            wav.append(torch.from_numpy(y).to(ref_text.device))
+            wav.append(torch.from_numpy(y.astype(np.float32)).to(ref_text.device))
             
             if len(wav) >= self.batch_percentage * len(waves): # prevent OOM due to longer lengths
                 break

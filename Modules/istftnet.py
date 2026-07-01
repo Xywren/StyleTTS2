@@ -89,19 +89,26 @@ class TorchSTFT(torch.nn.Module):
         self.window = torch.from_numpy(get_window(window, win_length, fftbins=True).astype(np.float32))
 
     def transform(self, input_data):
+        # MPS torch.stft + complex abs/angle are a known NaN source — run this whole block on CPU
+        # and move the (real) magnitude/phase back to the original device. Autograd flows across the
+        # device copy, so gradients are unaffected; only the STFT math leaves the GPU.
+        dev = input_data.device
+        x = input_data.cpu()
         forward_transform = torch.stft(
-            input_data,
-            self.filter_length, self.hop_length, self.win_length, window=self.window.to(input_data.device),
+            x,
+            self.filter_length, self.hop_length, self.win_length, window=self.window.cpu(),
             return_complex=True)
 
-        return torch.abs(forward_transform), torch.angle(forward_transform)
+        return torch.abs(forward_transform).to(dev), torch.angle(forward_transform).to(dev)
 
     def inverse(self, magnitude, phase):
+        dev = magnitude.device
+        mag, ph = magnitude.cpu(), phase.cpu()  # complex iSTFT on CPU — MPS path is NaN-prone
         inverse_transform = torch.istft(
-            magnitude * torch.exp(phase * 1j),
-            self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
+            mag * torch.exp(ph * 1j),
+            self.filter_length, self.hop_length, self.win_length, window=self.window.cpu())
 
-        return inverse_transform.unsqueeze(-2)  # unsqueeze to stay consistent with conv_transpose1d implementation
+        return inverse_transform.unsqueeze(-2).to(dev)  # unsqueeze to stay consistent with conv_transpose1d implementation
 
     def forward(self, input_data):
         self.magnitude, self.phase = self.transform(input_data)
@@ -503,9 +510,9 @@ class Decoder(nn.Module):
             downlist = [0, 3, 7, 15]
             N_down = downlist[random.randint(0, 3)]
             if F0_down:
-                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down).to('cuda'), padding=F0_down//2).squeeze(1) / F0_down
+                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down, device=F0_curve.device), padding=F0_down//2).squeeze(1) / F0_down
             if N_down:
-                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down).to('cuda'), padding=N_down//2).squeeze(1)  / N_down
+                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down, device=N.device), padding=N_down//2).squeeze(1) / N_down
 
         
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
