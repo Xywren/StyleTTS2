@@ -167,8 +167,17 @@ def length_to_mask(lengths):
     mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
     return torch.gt(mask + 1, lengths.unsqueeze(1))
 
+# Longform style carry: sentences of one utterance are synthesised as separate requests,
+# and an independently sampled style per sentence causes audible tone jumps at the joins.
+# Carry a running style vector across requests and blend each new sample into it. A gap
+# longer than STYLE_RESET_GAP seconds means a new utterance, so the carry resets.
+STYLE_CARRY     = 0.7   # weight of the running style vs the fresh sample
+STYLE_RESET_GAP = 8.0   # seconds
+_style_state = {'s': None, 'ts': 0.0}
+
+
 def synthesise_text(text, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scale=1.0,
-                    speed=1.0, pause_scale=1.0):
+                    speed=1.0, pause_scale=1.0, style_reset=False):
     text = preprocess(text.replace('"', ''))
     tokens = textcleaner(phonemize(text))
     tokens.insert(0, 0)
@@ -190,6 +199,14 @@ def synthesise_text(text, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_scal
             embedding=bert_dur, embedding_scale=embedding_scale,
             features=ref_s, num_steps=diffusion_steps,
         ).squeeze(1)
+
+        now = _time.time()
+        prev = _style_state['s']
+        if style_reset or prev is None or (now - _style_state['ts']) > STYLE_RESET_GAP:
+            prev = None
+        if prev is not None:
+            s_pred = STYLE_CARRY * prev + (1 - STYLE_CARRY) * s_pred
+        _style_state['s'], _style_state['ts'] = s_pred, now
 
         s   = beta  * s_pred[:, 128:] + (1 - beta)  * ref_s[:, 128:]
         ref = alpha * s_pred[:, :128] + (1 - alpha) * ref_s[:, :128]
@@ -254,6 +271,7 @@ def load_model():
         _gc2.collect()
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
+        _style_state['s'] = None  # style vectors from another checkpoint don't transfer
     import sys as _sys2
     _sys2.stderr.write(f'[load_model] loaded {path}\n'); _sys2.stderr.flush()
     return jsonify({'ok': True})
@@ -268,11 +286,13 @@ def synthesise():
     embedding_scale  = float(data.get('embedding_scale', 1.0))
     speed            = float(data.get('speed', 1.0))
     pause_scale      = float(data.get('pause_scale', 1.0))
+    style_reset      = bool(data.get('style_reset', False))
     import sys as _sys
     _sys.stderr.write(f'[synthesise] text={repr(text)} steps={diffusion_steps} alpha={alpha} beta={beta} scale={embedding_scale} speed={speed} pause={pause_scale}\n'); _sys.stderr.flush()
     with _model_lock:
         wav = synthesise_text(text, alpha=alpha, beta=beta, diffusion_steps=diffusion_steps,
-                              embedding_scale=embedding_scale, speed=speed, pause_scale=pause_scale)
+                              embedding_scale=embedding_scale, speed=speed, pause_scale=pause_scale,
+                              style_reset=style_reset)
     _raw_peak = np.abs(wav).max()
     _raw_nans = int(np.isnan(wav).sum())
     _sys.stderr.write(f'[synthesise] raw shape={wav.shape} peak={_raw_peak:.4f} nans={_raw_nans}\n'); _sys.stderr.flush()
