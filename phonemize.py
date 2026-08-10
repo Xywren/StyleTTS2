@@ -19,12 +19,18 @@ import re as _re
 import json as _json
 import os as _os
 
-# phonemizer locates libespeak-ng via ctypes; on Homebrew macOS the dylib isn't on the
-# default search path, so point at it explicitly unless the caller already has.
+# phonemizer locates libespeak-ng via ctypes; it isn't always on the default search
+# path, so point at it explicitly unless the caller already has.
 if 'PHONEMIZER_ESPEAK_LIBRARY' not in _os.environ:
-    for _cand in ('/opt/homebrew/lib/libespeak-ng.dylib',
-                  '/usr/local/lib/libespeak-ng.dylib',
-                  '/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1'):
+    _home = _os.path.expanduser('~')
+    _ext = '.dylib' if _os.uname().sysname == 'Darwin' else '.so.1'
+    for _cand in (
+        _os.path.join(_home, 'ARI', 'tools', 'espeak-ng', 'lib', f'libespeak-ng{_ext}'),
+        '/opt/homebrew/lib/libespeak-ng.dylib',
+        '/usr/local/lib/libespeak-ng.dylib',
+        '/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1',
+        '/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1',
+    ):
         if _os.path.exists(_cand):
             _os.environ['PHONEMIZER_ESPEAK_LIBRARY'] = _cand
             break

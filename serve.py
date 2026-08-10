@@ -12,6 +12,8 @@ parser.add_argument('--ref_audio', required=True)
 parser.add_argument('--port',      type=int, default=8020)
 parser.add_argument('--phoneme_subs', default=None,
                     help='Path to a PhonemeSubstitutions.json outside this repo (optional).')
+parser.add_argument('--cpu', action='store_true',
+                    help='Force CPU inference even when GPU is available.')
 args = parser.parse_args()
 
 # Run from the StyleTTS2 repo root so local imports resolve
@@ -42,7 +44,9 @@ from utils import *
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 from Utils.PLBERT.util import load_plbert
 
-if torch.cuda.is_available():
+if args.cpu:
+    device = 'cpu'
+elif torch.cuda.is_available():
     device = 'cuda'
 elif torch.backends.mps.is_available():
     device = 'mps'
