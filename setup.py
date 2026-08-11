@@ -121,7 +121,7 @@ def _msvc_check():
 
 def install(module_dir=None):
     install_dir = module_dir or os.path.join(os.path.expanduser("~"), "ARI",
-                                              "voice-modules", "StyleTTS2")
+                                              "Server", "VoiceModules", "StyleTTS2")
     venv_dir = os.path.join(install_dir, "venv")
     marker_path = os.path.join(install_dir, ".deps-installed")
 
