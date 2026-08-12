@@ -8,6 +8,7 @@ librosa
 nltk
 matplotlib
 tensorboard
+pandas
 accelerate
 transformers
 einops

@@ -5,6 +5,8 @@ import time
 from munch import Munch
 import numpy as np
 import torch
+_orig_load = torch.load
+torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False})
 from torch import nn
 import torch.nn.functional as F
 import torchaudio

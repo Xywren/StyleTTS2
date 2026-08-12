@@ -6,15 +6,22 @@ from flask import Flask, request, Response, jsonify
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model',     required=True)
-parser.add_argument('--config',    required=True)
-parser.add_argument('--ref_audio', required=True)
+parser.add_argument('--voice-dir', required=True,
+                    help='Path to the voice directory containing model.pth, config.yml, reference.wav')
 parser.add_argument('--port',      type=int, default=8020)
-parser.add_argument('--phoneme_subs', default=None,
+parser.add_argument('--data-dir',  default=None,
+                    help='Path to mutable data directory (pretrained cache, etc.)')
+parser.add_argument('--phoneme-subs', default=None,
                     help='Path to a PhonemeSubstitutions.json outside this repo (optional).')
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU inference even when GPU is available.')
 args = parser.parse_args()
+
+# Resolve model/config/ref_audio from voice directory
+args.model = os.path.join(args.voice_dir, 'model.pth')
+args.config = os.path.join(args.voice_dir, 'config.yml')
+args.ref_audio = os.path.join(args.voice_dir, 'reference.wav')
+args.phoneme_subs = args.phoneme_subs
 
 # Run from the StyleTTS2 repo root so local imports resolve
 repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -314,5 +321,250 @@ def synthesise():
     wav_bytes = buf.getvalue()
     _sys.stderr.write(f'[synthesise] peak_after_norm={peak:.4f} duration_s={len(wav_np)/24000:.2f}s bytes={len(wav_bytes)}\n'); _sys.stderr.flush()
     return Response(wav_bytes, mimetype='audio/wav')
+
+# ---------------------------------------------------------------------------
+# Training endpoints
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess
+import signal as _signal
+import collections as _collections
+
+_train_state = {
+    'status': 'idle',       # idle | running | pausing | paused | completed | failed
+    'process': None,        # subprocess.Popen
+    'exit_code': None,
+    'log': _collections.deque(maxlen=50),
+    'progress': {'step': 'Idle', 'percent': 0, 'detail': None},
+    'config_path': None,
+    'log_file': None,       # path to Train.log
+    'last_log_pos': 0,      # file position we've read up to
+    'voice_dir': None,      # voice directory (for sentinel files)
+}
+
+
+def _build_training_config(data):
+    """Build a config_ft.yml from the training request payload and return its path."""
+    voice_dir = data['voice_dir']
+    audio_path = data['audio_path']
+    model_name = data.get('model_name', 'finetuned')
+    num_epochs = int(data.get('epochs', 50))
+    save_every = int(data.get('save_every', 5))
+    do_retrain = bool(data.get('retrain', False))
+
+    base_config_path = os.path.join(voice_dir, 'config_ft.yml')
+    if not os.path.exists(base_config_path):
+        base_config_path = os.path.join(voice_dir, 'config.yml')
+    if not os.path.exists(base_config_path):
+        base_config_path = os.path.join(repo_root, 'Configs', 'config_ft.yml')
+    with open(base_config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    # Build train_list.txt from transcripts or wav/txt pairs in audio_path
+    transcripts = data.get('transcripts')
+    if isinstance(transcripts, str):
+        import json as _json
+        transcripts = _json.loads(transcripts)
+
+    phoneme_subs_path = data.get('phoneme_subs')
+
+    train_list_path = os.path.join(audio_path, 'train_list.txt')
+    if transcripts or not os.path.exists(train_list_path):
+        lines = []
+        if transcripts:
+            for fname, text in transcripts.items():
+                wav_path = os.path.join(audio_path, fname)
+                if os.path.exists(wav_path):
+                    cleaned = preprocess(text.replace('"', ''))
+                    ipa = phonemize(cleaned)
+                    lines.append(f'{wav_path}|{ipa}|0')
+        else:
+            for f in sorted(os.listdir(audio_path)):
+                if f.endswith('.wav'):
+                    txt_file = os.path.join(audio_path, f.replace('.wav', '.txt'))
+                    if os.path.exists(txt_file):
+                        text = open(txt_file).read().strip()
+                        cleaned = preprocess(text.replace('"', ''))
+                        ipa = phonemize(cleaned)
+                        wav_path = os.path.join(audio_path, f)
+                        lines.append(f'{wav_path}|{ipa}|0')
+        with open(train_list_path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        sys.stderr.write(f'[train] Generated train_list.txt with {len(lines)} entries\n'); sys.stderr.flush()
+
+    cfg['epochs'] = num_epochs
+    cfg['save_freq'] = save_every
+    cfg['log_dir'] = voice_dir
+    cfg['data_params']['root_path'] = audio_path
+    cfg['data_params']['train_data'] = train_list_path
+    cfg['data_params']['val_data'] = train_list_path
+
+    # Find the best checkpoint to resume from:
+    # 1. Latest epoch_2nd_*.pth checkpoint (has epoch/optimizer state) → load_only_params=False
+    # 2. model.pth in voice dir (finished model, no optimizer state) → load_only_params=True
+    # 3. Base pretrained model from template → load_only_params=True
+    import glob as _glob
+    checkpoints = sorted(_glob.glob(os.path.join(voice_dir, 'epoch_2nd_*.pth')))
+    if checkpoints and not do_retrain:
+        cfg['pretrained_model'] = checkpoints[-1]
+        cfg['load_only_params'] = False
+        sys.stderr.write(f'[train] Resuming from checkpoint: {checkpoints[-1]}\n'); sys.stderr.flush()
+    elif os.path.exists(os.path.join(voice_dir, 'model.pth')) and not do_retrain:
+        cfg['pretrained_model'] = os.path.join(voice_dir, 'model.pth')
+        cfg['load_only_params'] = True
+    else:
+        pm = cfg.get('pretrained_model', '')
+        if pm and not os.path.isabs(pm):
+            pm = os.path.join(repo_root, pm)
+        if not pm or not os.path.exists(pm):
+            pm = ''
+        cfg['pretrained_model'] = pm
+        cfg['load_only_params'] = True
+
+    cfg['device'] = device
+    cfg['model_params']['multispeaker'] = False
+
+    import tempfile
+    out_path = os.path.join(tempfile.gettempdir(), f'ari_train_config_{model_name}.yml')
+    with open(out_path, 'w') as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+
+    return out_path
+
+
+def _poll_train_log():
+    """Read new lines from Train.log and update progress."""
+    log_file = _train_state['log_file']
+    if not log_file or not os.path.exists(log_file):
+        return
+
+    with open(log_file, 'r') as f:
+        f.seek(_train_state['last_log_pos'])
+        new_lines = f.readlines()
+        _train_state['last_log_pos'] = f.tell()
+
+    for line in new_lines:
+        line = line.strip()
+        if not line:
+            continue
+        _train_state['log'].append(line)
+        # Parse progress from lines like "Epoch [5/50], ..." or percentage patterns
+        if 'Epoch [' in line:
+            try:
+                ep_part = line.split('Epoch [')[1].split(']')[0]
+                cur, total = ep_part.split('/')
+                pct = int(100 * int(cur) / int(total))
+                _train_state['progress'] = {
+                    'step': f'Epoch {cur}/{total}',
+                    'percent': pct,
+                    'detail': line,
+                }
+            except (ValueError, IndexError):
+                pass
+
+
+@app.route('/train', methods=['POST'])
+def train():
+    if _train_state['status'] == 'running':
+        return jsonify({'error': 'Training already in progress'}), 409
+
+    data = request.json
+    config_path = _build_training_config(data)
+
+    voice_dir = data['voice_dir']
+    _train_state['voice_dir'] = voice_dir
+    _train_state['log_file'] = os.path.join(voice_dir, 'Train.log')
+    _train_state['last_log_pos'] = 0
+    _train_state['log'].clear()
+    _train_state['exit_code'] = None
+    _train_state['config_path'] = config_path
+    _train_state['progress'] = {'step': 'Starting', 'percent': 0, 'detail': 'Launching training process'}
+
+    # Delete existing Train.log so we start fresh
+    if _train_state['log_file'] and os.path.exists(_train_state['log_file']):
+        os.remove(_train_state['log_file'])
+
+    # Find the venv python or fall back to system python
+    venv_py = os.path.join(repo_root, 'venv', 'bin', 'python3')
+    if not os.path.exists(venv_py):
+        venv_py = os.path.join(repo_root, 'venv', 'Scripts', 'python.exe')
+    if not os.path.exists(venv_py):
+        venv_py = sys.executable
+
+    cmd = [venv_py, os.path.join(repo_root, 'train_finetune.py'), '-p', config_path]
+    sys.stderr.write(f'[train] Starting: {" ".join(cmd)}\n'); sys.stderr.flush()
+
+    proc = _subprocess.Popen(
+        cmd,
+        cwd=repo_root,
+        stdout=_subprocess.PIPE,
+        stderr=_subprocess.STDOUT,
+        preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
+    )
+    _train_state['process'] = proc
+    _train_state['status'] = 'running'
+
+    def _watch():
+        _last_line = [None]
+        for line in proc.stdout:
+            decoded = line.decode('utf-8', errors='replace').rstrip()
+            if decoded and decoded != _last_line[0]:
+                _last_line[0] = decoded
+                _train_state['log'].append(decoded)
+                sys.stderr.write(f'[train] {decoded}\n'); sys.stderr.flush()
+        proc.wait()
+        _poll_train_log()
+        _train_state['exit_code'] = proc.returncode
+        if _train_state['status'] == 'pausing':
+            _train_state['status'] = 'paused' if proc.returncode == 0 else 'failed'
+        elif _train_state['status'] == 'running':
+            _train_state['status'] = 'completed' if proc.returncode == 0 else 'failed'
+        sys.stderr.write(f'[train] Process exited with code {proc.returncode}, status={_train_state["status"]}\n'); sys.stderr.flush()
+
+    _threading.Thread(target=_watch, daemon=True).start()
+
+    return jsonify({'ok': True, 'config': config_path})
+
+
+@app.route('/train/status')
+def train_status():
+    _poll_train_log()
+    log_lines = list(_train_state['log'])
+    # Only return the last 20 lines to keep responses small
+    return jsonify({
+        'status': _train_state['status'],
+        'progress': _train_state['progress'],
+        'log': log_lines[-20:],
+        'exit_code': _train_state['exit_code'],
+    })
+
+
+@app.route('/train/pause', methods=['POST'])
+def train_pause():
+    proc = _train_state['process']
+    voice_dir = _train_state['voice_dir']
+    if proc and proc.poll() is None and _train_state['status'] == 'running' and voice_dir:
+        sentinel = os.path.join(voice_dir, '.stop_training')
+        with open(sentinel, 'w') as f:
+            f.write('pause')
+        _train_state['status'] = 'pausing'
+        return jsonify({'ok': True, 'message': 'Will pause after the current epoch finishes and checkpoint is saved'})
+    return jsonify({'error': 'No running training to pause'}), 400
+
+
+@app.route('/train/cancel', methods=['POST'])
+def train_cancel():
+    proc = _train_state['process']
+    if proc and proc.poll() is None:
+        os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        _train_state['status'] = 'failed'
+        _train_state['exit_code'] = -15
+        sentinel = os.path.join(_train_state.get('voice_dir', ''), '.stop_training')
+        if os.path.exists(sentinel):
+            try: os.remove(sentinel)
+            except: pass
+        return jsonify({'ok': True})
+    return jsonify({'error': 'No training process to cancel'}), 400
+
 
 app.run(port=args.port)
